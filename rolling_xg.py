@@ -39,6 +39,11 @@ MUTED = "#9AA4B2"
 MENU_BG = "#161B22"
 MENU_HOVER = "#2A3140"
 
+# Form fields share the menu background so panels, menus and inputs read as one
+# surface; the border is what separates a field from the sidebar behind it.
+FIELD_BG = "#161B22"
+FIELD_BORDER = "#2A3140"
+
 # Axis labels are always pure white, never MUTED — they carry the read of the
 # chart and grey loses them against the dark background at export sizes.
 LABEL_WHITE = "#FFFFFF"
@@ -691,8 +696,40 @@ CSS = f"""
   .stCaption, small {{ color:{MUTED} !important; }}
   [data-testid="stExpander"], [data-testid="stFileUploaderDropzone"] {{
       background:{PANEL}; border:1px solid #2A313B; border-radius:10px; }}
-  .stTextInput input, .stNumberInput input, .stTextArea textarea {{
-      background:{BG}; color:{TEXT}; border-color:#2A313B; }}
+  /* ---- text / number inputs and text areas ----
+     The <input> itself was already dark; what showed white was BaseWeb's
+     wrapper around it and the number-input stepper buttons, so all three
+     layers are set here. */
+  .stTextInput input, .stNumberInput input, .stTextArea textarea,
+  [data-testid="stTextInput"] input,
+  [data-testid="stNumberInput"] input,
+  [data-testid="stTextArea"] textarea {{
+      background:{FIELD_BG} !important; color:{TEXT} !important;
+      border-color:{FIELD_BORDER} !important;
+      -webkit-text-fill-color:{TEXT} !important; }}
+  div[data-baseweb="input"],
+  div[data-baseweb="textarea"],
+  div[data-baseweb="base-input"],
+  [data-testid="stNumberInputContainer"] {{
+      background:{FIELD_BG} !important;
+      border-color:{FIELD_BORDER} !important; }}
+  div[data-baseweb="input"] *,
+  div[data-baseweb="textarea"] *,
+  [data-testid="stNumberInputContainer"] * {{ color:{TEXT} !important; }}
+  /* the − / + steppers */
+  [data-testid="stNumberInput"] button,
+  [data-testid="stNumberInputStepDown"],
+  [data-testid="stNumberInputStepUp"] {{
+      background:{FIELD_BG} !important; color:{TEXT} !important;
+      border-color:{FIELD_BORDER} !important; }}
+  [data-testid="stNumberInput"] button:hover,
+  [data-testid="stNumberInputStepDown"]:hover,
+  [data-testid="stNumberInputStepUp"]:hover {{
+      background:{MENU_HOVER} !important; color:{TEXT} !important; }}
+  [data-testid="stNumberInput"] button svg,
+  [data-testid="stNumberInputStepDown"] svg,
+  [data-testid="stNumberInputStepUp"] svg {{ fill:{TEXT} !important; }}
+  input::placeholder, textarea::placeholder {{ color:{MUTED} !important; }}
 
   /* ---- closed select control ---- */
   div[data-baseweb="select"] > div {{ background:{BG}; border-color:#2A313B; }}
