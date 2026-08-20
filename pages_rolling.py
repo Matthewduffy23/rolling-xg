@@ -805,10 +805,14 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
                 ha="left", va="top", color=color, fontsize=ann_fs, zorder=6)
 
     if cfg.get("show_season_lines") and n:
+        # A Season x-axis already prints the season at exactly this game, so an
+        # in-plot label would just repeat the tick sitting under it. The dotted
+        # line still marks the boundary.
+        label_seasons = xmode != "Season"
         prev = None
         for g, s in zip(res["game"], res["Season"]):
             if prev is not None and s != prev:
-                vline(g, s, MUTED, tier=0, at_bottom=True)
+                vline(g, s if label_seasons else "", MUTED, tier=0, at_bottom=True)
             prev = s
 
     if cfg.get("show_change_lines") and n:
