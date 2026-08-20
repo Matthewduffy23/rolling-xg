@@ -299,6 +299,18 @@ def is_inverse_metric(name: str) -> bool:
 # down, so it was dropped rather than kept as a near-duplicate option.
 TEAM_BASES = ["Team - Opponent", "Team"]
 
+# What the chart is a rolling average *of*. Difference is the default so the
+# original behaviour is what you get without touching anything.
+SERIES_DIFF = "Difference (actual − expected)"
+SERIES_SINGLE = "Single metric"
+SERIES_TWO = "Two metrics (separate lines)"
+SERIES_OPTIONS = [SERIES_DIFF, SERIES_SINGLE, SERIES_TWO]
+
+BASELINE_OPTIONS = ["None", "Overall average",
+                    "Custom value (e.g. league average)"]
+
+TEAM_SOURCES = ["Team", "Opponent"]
+
 
 def build_team_frame(df: pd.DataFrame, team: str, metric: str, basis: str):
     """Join each chosen-team row to its opponent row on Date + Match."""
@@ -322,6 +334,53 @@ def build_team_frame(df: pd.DataFrame, team: str, metric: str, basis: str):
     merged["__opp_v"] = opp_v
     merged["__diff"] = diff
     return merged, missing
+
+
+# --------------------------------------------------------------------------
+# Single-metric sidebar controls.
+#
+# Split into three small pieces because the pieces are needed in different
+# combinations: the Team difference basis needs the invert checkbox but no
+# baseline, the two-metric series needs the baseline but no invert, and the
+# single-metric series needs all three. Every mode goes through these — there
+# is only one implementation of the single-metric treatment.
+# --------------------------------------------------------------------------
+def single_metric_invert(metric: str, key=None) -> bool:
+    return st.sidebar.checkbox(
+        "Lower is better (e.g. PPDA)", value=is_inverse_metric(metric),
+        key=key,
+        help="Flips the good/bad colouring. On a difference basis it also "
+             "flips the sign so positive still means better.",
+    )
+
+
+def metric_totals(vals, label: str) -> str:
+    vals = pd.to_numeric(vals, errors="coerce")
+    return (f"{label} total: {fmt_num(vals.sum(skipna=True))} / "
+            f"per game: {fmt_num(vals.mean(skipna=True))}")
+
+
+def baseline_controls(vals, key_prefix: str = "", default_index: int = 1):
+    """Returns (mode, value, label). Value is None when the mode is None."""
+    vals = pd.to_numeric(vals, errors="coerce")
+    st.sidebar.markdown("### Baseline")
+    mode = st.sidebar.selectbox("Baseline", BASELINE_OPTIONS,
+                                index=default_index, key=f"{key_prefix}bmode")
+    mean_v = float(vals.mean(skipna=True)) if vals.notna().any() else 0.0
+    value, label = None, ""
+    if mode == "Overall average":
+        value = mean_v
+        label = st.sidebar.text_input("Baseline label",
+                                      f"Average {fmt_num(mean_v)}",
+                                      key=f"{key_prefix}blabel")
+    elif mode.startswith("Custom"):
+        value = float(st.sidebar.number_input(
+            "Baseline value", value=round(mean_v, 2), step=0.05,
+            format="%.4f", key=f"{key_prefix}bvalue"))
+        label = st.sidebar.text_input("Baseline label",
+                                      f"League avg {fmt_num(value)}",
+                                      key=f"{key_prefix}blabel")
+    return mode, value, label
 
 
 # ==========================================================================
@@ -461,6 +520,16 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
     # its own data, with an optional baseline.
     is_diff = bool(cfg.get("is_diff", True))
 
+    # Two metrics are drawn as two lines on one axis — not a difference, so
+    # they share the single-metric framing (no zero line, axis fitted to the
+    # data) and add a legend.
+    series = str(cfg.get("series") or (SERIES_DIFF if is_diff else SERIES_SINGLE))
+    is_two = series == SERIES_TWO
+    roll_b = (res["rolling_b"].to_numpy(dtype=float)
+              if is_two and "rolling_b" in res.columns else None)
+    if is_two and "rolling_a" in res.columns:
+        roll = res["rolling_a"].to_numpy(dtype=float)
+
     over_color = cfg.get("over_color", OVER_DEFAULT)
     under_color = cfg.get("under_color", UNDER_DEFAULT)
 
@@ -490,6 +559,8 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
             yhi = ylo + 1.0
     else:
         vals = [float(v) for v in roll[np.isfinite(roll)]]
+        if roll_b is not None:
+            vals += [float(v) for v in roll_b[np.isfinite(roll_b)]]
         if has_baseline:
             vals.append(baseline_v)
         if vals:
@@ -513,9 +584,35 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
     y_inverted = bool(cfg.get("invert")) and not is_diff
 
     # ---- series ----
-    is_area = cfg.get("chart_type", "Area (over / under)").startswith("Area")
+    # Two lines can only be lines; an over/under fill has no meaning when
+    # there are two independent series.
+    is_area = (cfg.get("chart_type", "Area (over / under)").startswith("Area")
+               and not is_two)
 
-    if is_diff:
+    if is_two:
+        lw = float(cfg.get("line_width", 2.5))
+        color_a = cfg.get("color_a", LINE_DEFAULT)
+        color_b = cfg.get("color_b", OVER_DEFAULT)
+        label_a = str(cfg.get("label_a") or "A")
+        label_b = str(cfg.get("label_b") or "B")
+
+        if cfg.get("shade_gap") and roll_b is not None:
+            # Only shade where both series exist, so a gap in one does not
+            # produce a fill against a value that was never measured.
+            both = np.isfinite(roll) & np.isfinite(roll_b)
+            a_s = np.where(both, roll, np.nan)
+            b_s = np.where(both, roll_b, np.nan)
+            ax.fill_between(x, a_s, b_s, where=(a_s >= b_s), interpolate=True,
+                            color=over_color, alpha=0.35, linewidth=0, zorder=2)
+            ax.fill_between(x, a_s, b_s, where=(b_s >= a_s), interpolate=True,
+                            color=under_color, alpha=0.35, linewidth=0, zorder=2)
+
+        ax.plot(x, roll, color=color_a, linewidth=lw, solid_capstyle="round",
+                zorder=4, label=label_a)
+        if roll_b is not None:
+            ax.plot(x, roll_b, color=color_b, linewidth=lw,
+                    solid_capstyle="round", zorder=4, label=label_b)
+    elif is_diff:
         if is_area:
             safe = np.nan_to_num(roll, nan=0.0)
             ax.fill_between(x, safe, 0, where=(safe >= 0), interpolate=True,
@@ -603,6 +700,12 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
         ax.set_xticklabels(
             [pd.Timestamp(res["Date"].iloc[i]).strftime("%b %y") for i in idx]
         )
+
+    # ---- legend (two-metric only) ----
+    if is_two:
+        ax.legend(loc="upper right", frameon=False, labelcolor=LABEL_WHITE,
+                  fontsize=ylabel_fs, handlelength=1.6,
+                  borderaxespad=0.8, labelspacing=0.45)
 
     # ---- rotated y labels (always white) ----
     lab_fs = ylabel_fs
@@ -819,21 +922,64 @@ def main() -> None:
         st.warning("No games left after filtering.")
         return
 
-    # ---------------- mode: build diff ----------------
+    # ---------------- mode: build the series ----------------
     st.sidebar.markdown("### Metric")
+    series = st.sidebar.radio(
+        "Series", SERIES_OPTIONS, index=0, key="series",
+        help="Difference is the over/under story. Single metric is a plain "
+             "rolling average. Two metrics draws both as separate lines.",
+    )
     over_label = "Over Performance"
     under_label = "Under Performance"
     missing_opp = 0
-    # Player and Goalkeeper are always a difference vs expected; only Team can
-    # be a plain rolling average of one raw metric.
-    is_diff = True
+    # Only the difference series is meaningful about zero.
+    is_diff = series == SERIES_DIFF
     y_label = ""
     invert = False
     baseline_mode = "None"
     baseline_value = None
     baseline_label = ""
+    label_a = label_b = ""
+    # (column label, values) pairs for the game-by-game table.
+    table_cols: list = []
 
-    if mode == "Player":
+    def metric_pick(lbl, default_name, key):
+        d = pick_col(nums, default_name) or (nums[0] if nums else None)
+        return st.sidebar.selectbox(lbl, nums,
+                                    index=nums.index(d) if d in nums else 0,
+                                    key=key)
+
+    if series == SERIES_SINGLE and mode in ("Player", "Goalkeeper"):
+        default = "Goals" if mode == "Player" else "Saves"
+        metric = metric_pick("Metric", default, "single_metric")
+        base = work.copy()
+        base["diff"] = pd.to_numeric(base[metric], errors="coerce")
+        y_label = metric
+        invert = single_metric_invert(metric, key="single_invert")
+        stat_default = metric_totals(base["diff"], metric)
+        baseline_mode, baseline_value, baseline_label = baseline_controls(
+            base["diff"], key_prefix="single_")
+        actual_col = expected_col = metric
+        table_cols = [(metric, base["diff"])]
+
+    elif series == SERIES_TWO and mode in ("Player", "Goalkeeper"):
+        def_a = "Goals" if mode == "Player" else "Conceded goals"
+        def_b = "xG" if mode == "Player" else "xCG"
+        col_a = metric_pick("Metric A", def_a, "two_a")
+        col_b = metric_pick("Metric B", def_b, "two_b")
+        base = work.copy()
+        base["a"] = pd.to_numeric(base[col_a], errors="coerce")
+        base["b"] = pd.to_numeric(base[col_b], errors="coerce")
+        base["diff"] = base["a"]
+        label_a, label_b = col_a, col_b
+        stat_default = (f"{metric_totals(base['a'], col_a)} · "
+                        f"{metric_totals(base['b'], col_b)}")
+        baseline_mode, baseline_value, baseline_label = baseline_controls(
+            base["a"], key_prefix="two_", default_index=0)
+        actual_col, expected_col = col_a, col_b
+        table_cols = [(col_a, base["a"]), (col_b, base["b"])]
+
+    elif mode == "Player":
         a_def = pick_col(nums, "Goals") or (nums[0] if nums else None)
         e_def = pick_col(nums, "xG") or (nums[0] if nums else None)
         actual_col = st.sidebar.selectbox("Actual", nums,
@@ -847,6 +993,7 @@ def main() -> None:
         stat_default = (f"{actual_col}: {fmt_num(a.sum())} / "
                         f"{expected_col}: {fmt_num(e.sum())} / "
                         f"{fmt_signed(a.sum() - e.sum())}")
+        table_cols = [(actual_col, a), (expected_col, e)]
 
     elif mode == "Goalkeeper":
         a_def = pick_col(nums, "Conceded goals", "Conceded", contains="conceded") or (nums[0] if nums else None)
@@ -863,6 +1010,7 @@ def main() -> None:
         stat_default = (f"{conceded_col}: {fmt_num(c.sum())} / "
                         f"{expected_col}: {fmt_num(e.sum())} / "
                         f"{fmt_signed(e.sum() - c.sum())}")
+        table_cols = [(conceded_col, c), (expected_col, e)]
 
     else:  # Team
         if "Team" not in work.columns:
@@ -874,66 +1022,102 @@ def main() -> None:
             st.error("No team rows found.")
             return
         team = st.sidebar.selectbox("Team", list(counts.index), index=0)
-        metric_default = pick_col(nums, "xG") or (nums[0] if nums else None)
-        metric = st.sidebar.selectbox("Metric", nums,
-                                      index=nums.index(metric_default) if metric_default in nums else 0)
-        basis = st.sidebar.selectbox("Basis", TEAM_BASES, index=0)
 
-        is_diff = basis == "Team - Opponent"
+        def team_values(frame, metric_name, source):
+            """Own or opponent column, and the label that goes with it."""
+            col = frame["__own_v"] if source == "Team" else frame["__opp_v"]
+            lbl = metric_name if source == "Team" else f"Opponent {metric_name}"
+            return col, lbl
 
-        invert = st.sidebar.checkbox(
-            "Lower is better (e.g. PPDA)", value=is_inverse_metric(metric),
-            help="Flips the good/bad colouring. On a difference basis it also "
-                 "flips the sign so positive still means better.",
-        )
+        if series == SERIES_SINGLE:
+            metric = metric_pick("Metric", "xG", "single_metric")
+            src = st.sidebar.selectbox("Values from", TEAM_SOURCES, index=0,
+                                       key="single_src")
+            frame, missing_opp = build_team_frame(work, team, metric, "Team")
+            base = frame.rename(columns={"__diff": "diff"})
+            vals, y_label = team_values(base, metric, src)
+            base["diff"] = vals
+            invert = single_metric_invert(metric, key="single_invert")
+            stat_default = metric_totals(base["diff"], y_label)
+            baseline_mode, baseline_value, baseline_label = baseline_controls(
+                base["diff"], key_prefix="single_")
+            actual_col, expected_col = metric, f"Opponent {metric}"
+            table_cols = [(metric, base["__own_v"]),
+                          (f"Opponent {metric}", base["__opp_v"])]
 
-        base, missing_opp = build_team_frame(work, team, metric, basis)
-        base = base.rename(columns={"__diff": "diff"})
+        elif series == SERIES_TWO:
+            col_a = metric_pick("Metric A", "xG", "two_a")
+            src_a = st.sidebar.selectbox("A from", TEAM_SOURCES, index=0,
+                                         key="two_src_a")
+            col_b = metric_pick("Metric B", "Goals", "two_b")
+            src_b = st.sidebar.selectbox("B from", TEAM_SOURCES, index=0,
+                                         key="two_src_b")
+            # Two merges over the same own-team rows, so the frames line up
+            # row for row and B can be dropped straight onto A's frame.
+            frame_a, missing_opp = build_team_frame(work, team, col_a, "Team")
+            frame_b, _ = build_team_frame(work, team, col_b, "Team")
+            base = frame_a.rename(columns={"__diff": "diff"})
+            va, label_a = team_values(frame_a, col_a, src_a)
+            vb, label_b = team_values(frame_b, col_b, src_b)
+            base["a"] = va.to_numpy()
+            base["b"] = vb.to_numpy()
+            base["diff"] = base["a"]
+            stat_default = (f"{metric_totals(base['a'], label_a)} · "
+                            f"{metric_totals(base['b'], label_b)}")
+            baseline_mode, baseline_value, baseline_label = baseline_controls(
+                base["a"], key_prefix="two_", default_index=0)
+            actual_col, expected_col = label_a, label_b
+            table_cols = [(label_a, base["a"]), (label_b, base["b"])]
 
-        own_tot = base["__own_v"].sum(skipna=True)
-        opp_tot = base["__opp_v"].sum(skipna=True)
-
-        if is_diff:
-            if invert:
-                # Positive should always read as "good", so a lower-is-better
-                # metric has its difference negated rather than recoloured.
-                base["diff"] = -base["diff"]
-                over_label, under_label = "Better than opponent", "Worse than opponent"
-                signed = fmt_signed(opp_tot - own_tot)
-            else:
-                signed = fmt_signed(own_tot - opp_tot)
-            stat_default = (f"{metric}: {fmt_num(own_tot)} / "
-                            f"Opp: {fmt_num(opp_tot)} / {signed}")
         else:
-            # Single raw metric: a rolling average, not an over/under story.
-            disp = metric
-            y_label = disp
-            vals = pd.to_numeric(base["diff"], errors="coerce")
-            stat_default = (f"{disp} total: {fmt_num(vals.sum(skipna=True))} / "
-                            f"per game: {fmt_num(vals.mean(skipna=True))}")
+            metric_default = pick_col(nums, "xG") or (nums[0] if nums else None)
+            metric = st.sidebar.selectbox("Metric", nums,
+                                          index=nums.index(metric_default) if metric_default in nums else 0)
+            basis = st.sidebar.selectbox("Basis", TEAM_BASES, index=0)
 
-            st.sidebar.markdown("### Baseline")
-            baseline_mode = st.sidebar.selectbox(
-                "Baseline",
-                ["None", "Overall average", "Custom value (e.g. league average)"],
-                index=1,
+            is_diff = basis == "Team - Opponent"
+
+            invert = st.sidebar.checkbox(
+                "Lower is better (e.g. PPDA)", value=is_inverse_metric(metric),
+                help="Flips the good/bad colouring. On a difference basis it also "
+                     "flips the sign so positive still means better.",
             )
-            mean_v = float(vals.mean(skipna=True)) if vals.notna().any() else 0.0
-            if baseline_mode == "Overall average":
-                baseline_value = mean_v
-                baseline_label = st.sidebar.text_input(
-                    "Baseline label", f"Average {fmt_num(mean_v)}")
-            elif baseline_mode.startswith("Custom"):
-                baseline_value = float(st.sidebar.number_input(
-                    "Baseline value", value=round(mean_v, 2), step=0.05, format="%.4f"))
-                baseline_label = st.sidebar.text_input(
-                    "Baseline label", f"League avg {fmt_num(baseline_value)}")
 
-        actual_col, expected_col = metric, f"Opponent {metric}"
+            base, missing_opp = build_team_frame(work, team, metric, basis)
+            base = base.rename(columns={"__diff": "diff"})
+
+            own_tot = base["__own_v"].sum(skipna=True)
+            opp_tot = base["__opp_v"].sum(skipna=True)
+
+            if is_diff:
+                if invert:
+                    # Positive should always read as "good", so a lower-is-better
+                    # metric has its difference negated rather than recoloured.
+                    base["diff"] = -base["diff"]
+                    over_label, under_label = "Better than opponent", "Worse than opponent"
+                    signed = fmt_signed(opp_tot - own_tot)
+                else:
+                    signed = fmt_signed(own_tot - opp_tot)
+                stat_default = (f"{metric}: {fmt_num(own_tot)} / "
+                                f"Opp: {fmt_num(opp_tot)} / {signed}")
+            else:
+                # Basis "Team" is the same single-metric treatment, so it runs
+                # through the same shared controls rather than its own copy.
+                y_label = metric
+                stat_default = metric_totals(base["diff"], metric)
+                baseline_mode, baseline_value, baseline_label = baseline_controls(
+                    base["diff"], key_prefix="basis_")
+
+            actual_col, expected_col = metric, f"Opponent {metric}"
+            table_cols = [(metric, base["__own_v"]),
+                          (f"Opponent {metric}", base["__opp_v"])]
 
         st.info(f"{team}: {len(base):,} matches. "
                 + (f"**{missing_opp} opponent row(s) missing.**" if missing_opp
                    else "0 opponent rows missing."))
+
+    for i, (_, vals) in enumerate(table_cols):
+        base[f"__tbl{i}"] = np.asarray(vals, dtype=float)
 
     base = base[base["diff"].notna()].copy()
     if base.empty:
@@ -946,8 +1130,11 @@ def main() -> None:
     st.sidebar.markdown("### Rolling")
     window = int(st.sidebar.number_input("Window (games)", 1, 100, 10, step=1))
     full_only = st.sidebar.checkbox("Start only once full window available", value=True)
-    base["rolling"] = base["diff"].rolling(
-        window=window, min_periods=window if full_only else 1).mean()
+    min_p = window if full_only else 1
+    base["rolling"] = base["diff"].rolling(window=window, min_periods=min_p).mean()
+    if series == SERIES_TWO:
+        base["rolling_a"] = base["a"].rolling(window=window, min_periods=min_p).mean()
+        base["rolling_b"] = base["b"].rolling(window=window, min_periods=min_p).mean()
 
     res = base.copy()
     for c in ("Season", "Competition", "Match", "Team"):
@@ -958,16 +1145,37 @@ def main() -> None:
 
     # ---------------- chart settings ----------------
     st.sidebar.markdown("### Chart")
-    chart_type = st.sidebar.radio("Type", ["Area (over / under)", "Line"], index=0)
-    if chart_type.startswith("Area"):
+    color_a, color_b = LINE_DEFAULT, OVER_DEFAULT
+    shade_gap = False
+    if series == SERIES_TWO:
+        # Two independent series cannot be an over/under fill, so the Area
+        # option is not offered at all.
+        chart_type = "Line"
         c1, c2 = st.sidebar.columns(2)
-        over_color = c1.color_picker("Over", OVER_DEFAULT)
-        under_color = c2.color_picker("Under", UNDER_DEFAULT)
-        line_color, line_width = LINE_DEFAULT, 2.5
+        color_a = c1.color_picker("Line A", LINE_DEFAULT, key="two_color_a")
+        color_b = c2.color_picker("Line B", OVER_DEFAULT, key="two_color_b")
+        line_color, line_width = color_a, st.sidebar.slider(
+            "Line width", 0.5, 8.0, 2.5, 0.1, key="two_lw")
+        shade_gap = st.sidebar.checkbox(
+            "Shade gap", value=False, key="two_shade",
+            help="Fills between the two lines, coloured by which one is on top.")
+        if shade_gap:
+            g1, g2 = st.sidebar.columns(2)
+            over_color = g1.color_picker("A above B", OVER_DEFAULT, key="two_over")
+            under_color = g2.color_picker("B above A", UNDER_DEFAULT, key="two_under")
+        else:
+            over_color, under_color = OVER_DEFAULT, UNDER_DEFAULT
     else:
-        over_color, under_color = OVER_DEFAULT, UNDER_DEFAULT
-        line_color = st.sidebar.color_picker("Line", LINE_DEFAULT)
-        line_width = st.sidebar.slider("Line width", 0.5, 8.0, 2.5, 0.1)
+        chart_type = st.sidebar.radio("Type", ["Area (over / under)", "Line"], index=0)
+        if chart_type.startswith("Area"):
+            c1, c2 = st.sidebar.columns(2)
+            over_color = c1.color_picker("Over", OVER_DEFAULT)
+            under_color = c2.color_picker("Under", UNDER_DEFAULT)
+            line_color, line_width = LINE_DEFAULT, 2.5
+        else:
+            over_color, under_color = OVER_DEFAULT, UNDER_DEFAULT
+            line_color = st.sidebar.color_picker("Line", LINE_DEFAULT)
+            line_width = st.sidebar.slider("Line width", 0.5, 8.0, 2.5, 0.1)
 
     # Symmetric-about-zero limits only make sense for a difference series.
     ylim_value = 1.0
@@ -979,8 +1187,11 @@ def main() -> None:
     else:
         ylim_mode = st.sidebar.radio("Y limits", ["Auto (from data)", "Fixed"], index=0)
         if ylim_mode == "Fixed":
-            data_lo = float(np.nanmin(res["rolling"])) if res["rolling"].notna().any() else 0.0
-            data_hi = float(np.nanmax(res["rolling"])) if res["rolling"].notna().any() else 1.0
+            span_cols = (["rolling_a", "rolling_b"] if series == SERIES_TWO
+                         else ["rolling"])
+            span = pd.concat([res[c] for c in span_cols if c in res.columns])
+            data_lo = float(np.nanmin(span)) if span.notna().any() else 0.0
+            data_hi = float(np.nanmax(span)) if span.notna().any() else 1.0
             ylim_min = float(st.sidebar.number_input(
                 "Y min", value=round(data_lo, 2), step=0.1, format="%.4f"))
             ylim_max = float(st.sidebar.number_input(
@@ -1082,6 +1293,8 @@ def main() -> None:
         "footer": footer, "title_fs": title_fs,
         "over_label": over_label, "under_label": under_label,
         "is_diff": is_diff, "y_label": y_label, "invert": invert,
+        "series": series, "label_a": label_a, "label_b": label_b,
+        "color_a": color_a, "color_b": color_b, "shade_gap": shade_gap,
         "baseline_mode": baseline_mode, "baseline_value": baseline_value,
         "baseline_label": baseline_label,
         "stat_text": stat_text if show_stats else "", "stat_corner": stat_corner,
@@ -1121,12 +1334,14 @@ def main() -> None:
             "Competition": res["Competition"],
             "Match": res["Match"],
         })
-        if mode == "Team":
-            table[actual_col] = res["__own_v"].round(2)
-            table[expected_col] = res["__opp_v"].round(2)
+        for i, (lbl, _) in enumerate(table_cols):
+            # Same metric twice (e.g. A and B both "Goals") would collide.
+            name = lbl if lbl not in table.columns else f"{lbl} ({i + 1})"
+            table[name] = pd.to_numeric(res[f"__tbl{i}"], errors="coerce").round(2)
+        if series == SERIES_TWO:
+            table["Rolling A"] = res["rolling_a"].round(3)
+            table["Rolling B"] = res["rolling_b"].round(3)
         else:
-            table[actual_col] = pd.to_numeric(res[actual_col], errors="coerce").round(2)
-            table[expected_col] = pd.to_numeric(res[expected_col], errors="coerce").round(2)
-        table["Diff"] = res["diff"].round(3)
-        table["Rolling"] = res["rolling"].round(3)
+            table["Diff" if is_diff else "Value"] = res["diff"].round(3)
+            table["Rolling"] = res["rolling"].round(3)
         st.dataframe(table, width="stretch", hide_index=True)
