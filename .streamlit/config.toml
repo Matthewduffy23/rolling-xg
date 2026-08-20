@@ -1,0 +1,8 @@
+# Native Streamlit theming. Widgets (dropdowns, inputs, steppers, chips) pick
+# these up directly, which is why rolling_xg.py no longer patches them by CSS.
+[theme]
+base = "dark"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#161B22"
+textColor = "#F2F4F7"
+primaryColor = "#1F3FE0"

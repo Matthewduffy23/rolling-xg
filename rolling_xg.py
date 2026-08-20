@@ -284,6 +284,11 @@ def is_inverse_metric(name: str) -> bool:
     return any(h in low for h in INVERSE_HINTS)
 
 
+# The only two bases. An opponent-centred view is the same chart read upside
+# down, so it was dropped rather than kept as a near-duplicate option.
+TEAM_BASES = ["Team - Opponent", "Team"]
+
+
 def build_team_frame(df: pd.DataFrame, team: str, metric: str, basis: str):
     """Join each chosen-team row to its opponent row on Date + Match."""
     own = df[df["Team"] == team].copy()
@@ -300,14 +305,7 @@ def build_team_frame(df: pd.DataFrame, team: str, metric: str, basis: str):
     own_v = pd.to_numeric(merged[metric], errors="coerce")
     opp_v = pd.to_numeric(merged["__opp"], errors="coerce")
 
-    if basis == "Team - Opponent":
-        diff = own_v - opp_v
-    elif basis == "Opponent - Team":
-        diff = opp_v - own_v
-    elif basis == "Team":
-        diff = own_v
-    else:  # "Opponent"
-        diff = opp_v
+    diff = own_v - opp_v if basis == "Team - Opponent" else own_v
 
     merged["__own_v"] = own_v
     merged["__opp_v"] = opp_v
@@ -370,13 +368,18 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
 
     fig = plt.figure(figsize=(W / dpi, H / dpi), dpi=dpi, facecolor=BG)
 
-    left_px, right_px = 120.0, 58.0
+    # Everything typographic is expressed relative to a 900px-tall figure, so a
+    # 1920x1080 export is the same composition scaled up rather than the same
+    # point sizes stranded on a bigger canvas.
+    S = H / 900.0
+
+    left_px, right_px = 120.0 * S, 58.0 * S
     left, right = left_px / W, 1.0 - right_px / W
     avail_px = W - left_px - right_px
 
     # ---- title block (pixel-aware line heights) ----
-    tfs = float(cfg["title_fs"])
-    y = 1.0 - 26.0 / H
+    tfs = float(cfg["title_fs"]) * S
+    y = 1.0 - (26.0 * S) / H
 
     cpl = max(12, int(avail_px / (0.56 * tfs * dpi / 72.0)))
     title_lines: list[tuple[str, bool]] = []
@@ -397,27 +400,27 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
 
     sub = str(cfg.get("subtitle") or "").strip()
     if sub:
-        sfs = max(9.0, tfs * 0.46)
+        sfs = max(9.0 * S, tfs * 0.46)
         if title_lines:
-            y -= 5.0 / H
+            y -= (5.0 * S) / H
         scpl = max(12, int(avail_px / (0.56 * sfs * dpi / 72.0)))
         for w in textwrap.wrap(sub, scpl) or [sub]:
             fig.text(left, y, w, ha="left", va="top", color=MUTED,
                      fontsize=sfs, style="italic")
             y -= _line_height(sfs, dpi, H)
 
-    top = y - 20.0 / H
+    top = y - (20.0 * S) / H
     top = float(np.clip(top, 0.30, 0.97))
 
     # ---- footer ----
-    ffs = max(7.5, tfs * 0.30)
+    ffs = max(8.0 * S, tfs * 0.30)
     footer = str(cfg.get("footer") or "").strip()
     if footer:
-        fig.text(left, 16.0 / H, footer, ha="left", va="bottom",
+        fig.text(left, (16.0 * S) / H, footer, ha="left", va="bottom",
                  color=MUTED, fontsize=ffs)
 
     xmode = cfg.get("xaxis_mode", "Season")
-    bottom_px = (30.0 if footer else 12.0) + (30.0 if xmode != "None" else 6.0)
+    bottom_px = ((32.0 if footer else 14.0) + (40.0 if xmode != "None" else 6.0)) * S
     bottom = float(np.clip(bottom_px / H, 0.04, 0.4))
 
     fig.subplots_adjust(left=left, right=right, top=top, bottom=bottom)
@@ -519,14 +522,25 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
                     solid_capstyle="round", zorder=4)
 
     # ---- cosmetics ----
+    # Tick labels are text colour, not MUTED: grey at export sizes is what made
+    # them unreadable. ~12pt on a 900px-tall figure, scaling with it.
+    tick_fs = max(12.0 * S, tfs * 0.42)
     for sp in ax.spines.values():
         sp.set_visible(False)
-    ax.tick_params(axis="both", length=0, colors=MUTED,
-                   labelsize=max(7.5, tfs * 0.30))
-    ax.set_yticks([])
+    ax.tick_params(axis="both", length=0, colors=TEXT, labelsize=tick_fs,
+                   pad=6.0 * S)
+
+    # ---- y ticks ----
+    # Five interior values across the range so the reader can size the swing.
+    # The extremes are dropped deliberately: a label at the very top or bottom
+    # of the axes collides with the title block and with the x-axis tick.
+    yticks = np.linspace(ylo, yhi, 7)[1:-1]
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(
+        [(fmt_signed(v) if is_diff else fmt_num(v)) for v in yticks],
+        color=TEXT, fontsize=tick_fs,
+    )
     if cfg.get("gridlines"):
-        ax.set_yticks(np.linspace(ylo, yhi, 5))
-        ax.set_yticklabels([])
         ax.grid(axis="y", color=MUTED, alpha=0.14, linewidth=0.8)
         ax.set_axisbelow(True)
 
@@ -557,8 +571,8 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
         )
 
     # ---- rotated y labels (always white) ----
-    lab_fs = max(9.0, tfs * 0.38)
-    lab_x = 40.0 / W
+    lab_fs = max(11.0 * S, tfs * 0.38)
+    lab_x = (44.0 * S) / W
     if is_diff:
         fig.text(lab_x, bottom + 0.75 * (top - bottom),
                  cfg.get("over_label", "Over Performance"),
@@ -576,7 +590,7 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
                  color=LABEL_WHITE, fontsize=lab_fs)
 
     # ---- annotations ----
-    ann_fs = max(7.5, tfs * 0.28)
+    ann_fs = max(10.0 * S, tfs * 0.28)
     pill = dict(boxstyle="round,pad=0.32", facecolor=PANEL, edgecolor=MUTED,
                 linewidth=0.7, alpha=0.92)
 
@@ -672,7 +686,7 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
         }[corner]
         ax.text(
             pos[0], pos[1], str(cfg["stat_text"]), transform=ax.transAxes,
-            ha=pos[2], va=pos[3], color=TEXT, fontsize=max(8.0, tfs * 0.30),
+            ha=pos[2], va=pos[3], color=TEXT, fontsize=max(11.0 * S, tfs * 0.30),
             linespacing=1.45, zorder=7,
             bbox=dict(boxstyle="round,pad=0.55", facecolor=PANEL,
                       edgecolor=MUTED, linewidth=0.8, alpha=0.95),
@@ -689,115 +703,27 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
 # ==========================================================================
 CSS = f"""
 <style>
-  .stApp, [data-testid="stAppViewContainer"] {{ background:{BG}; color:{TEXT}; }}
-  [data-testid="stSidebar"] > div:first-child {{ background:{PANEL}; }}
-  [data-testid="stHeader"] {{ background:transparent; }}
-  h1,h2,h3,h4,h5,h6,p,label,span,div {{ color:{TEXT}; }}
-  .stCaption, small {{ color:{MUTED} !important; }}
+  /* Colours come from .streamlit/config.toml — base dark, backgroundColor,
+     secondaryBackgroundColor, textColor and primaryColor. Streamlit themes its
+     own widgets from those, so dropdowns, inputs, steppers and chips need no
+     CSS here. What is left is only what config.toml cannot express. */
+
+  /* Panel treatment for the uploader and expanders (rounded, hairline border). */
   [data-testid="stExpander"], [data-testid="stFileUploaderDropzone"] {{
-      background:{PANEL}; border:1px solid #2A313B; border-radius:10px; }}
-  /* ---- text / number inputs and text areas ----
-     The <input> itself was already dark; what showed white was BaseWeb's
-     wrapper around it and the number-input stepper buttons, so all three
-     layers are set here. */
-  .stTextInput input, .stNumberInput input, .stTextArea textarea,
-  [data-testid="stTextInput"] input,
-  [data-testid="stNumberInput"] input,
-  [data-testid="stTextArea"] textarea {{
-      background:{FIELD_BG} !important; color:{TEXT} !important;
-      border-color:{FIELD_BORDER} !important;
-      -webkit-text-fill-color:{TEXT} !important; }}
-  div[data-baseweb="input"],
-  div[data-baseweb="textarea"],
-  div[data-baseweb="base-input"],
-  [data-testid="stNumberInputContainer"] {{
-      background:{FIELD_BG} !important;
-      border-color:{FIELD_BORDER} !important; }}
-  div[data-baseweb="input"] *,
-  div[data-baseweb="textarea"] *,
-  [data-testid="stNumberInputContainer"] * {{ color:{TEXT} !important; }}
-  /* the − / + steppers */
-  [data-testid="stNumberInput"] button,
-  [data-testid="stNumberInputStepDown"],
-  [data-testid="stNumberInputStepUp"] {{
-      background:{FIELD_BG} !important; color:{TEXT} !important;
-      border-color:{FIELD_BORDER} !important; }}
-  [data-testid="stNumberInput"] button:hover,
-  [data-testid="stNumberInputStepDown"]:hover,
-  [data-testid="stNumberInputStepUp"]:hover {{
-      background:{MENU_HOVER} !important; color:{TEXT} !important; }}
-  [data-testid="stNumberInput"] button svg,
-  [data-testid="stNumberInputStepDown"] svg,
-  [data-testid="stNumberInputStepUp"] svg {{ fill:{TEXT} !important; }}
-  input::placeholder, textarea::placeholder {{ color:{MUTED} !important; }}
+      background:{PANEL}; border:1px solid {FIELD_BORDER}; border-radius:10px; }}
 
-  /* ---- closed select control ---- */
-  div[data-baseweb="select"] > div {{ background:{BG}; border-color:#2A313B; }}
-  div[data-baseweb="select"] div,
-  div[data-baseweb="select"] span,
-  div[data-baseweb="select"] input {{ color:{TEXT} !important; }}
-  div[data-baseweb="select"] svg {{ fill:{MUTED} !important; }}
+  /* Captions read as secondary; the theme paints them at full text colour. */
+  .stCaption, [data-testid="stCaptionContainer"], small {{ color:{MUTED} !important; }}
 
-  /* ---- open dropdown menu ----
-     BaseWeb renders these in a portal with its own styles, which is why the
-     option text was dark-on-dark.
-
-     Two sets of selectors on purpose. Current Streamlit renders the list as
-     ul[data-testid="stSelectboxVirtualDropdown"] with plain <li> and NO role
-     attributes, so the role-based selectors below match nothing here — they
-     are kept for the BaseWeb markup other Streamlit versions emit. The
-     popover-descendant and data-testid rules are the ones doing the work. */
-  div[data-baseweb="popover"],
-  div[data-baseweb="popover"] > div,
-  div[data-baseweb="popover"] > div > div,
-  div[data-baseweb="popover"] ul,
-  div[data-baseweb="popover"] [data-baseweb="menu"],
-  div[data-baseweb="menu"],
-  ul[data-testid="stSelectboxVirtualDropdown"],
-  ul[data-testid="stSelectboxVirtualDropdownEmpty"],
-  ul[role="listbox"] {{
-      background:{MENU_BG} !important; color:{TEXT} !important; }}
-  div[data-baseweb="popover"] li,
-  div[data-baseweb="menu"] li,
-  ul[data-testid="stSelectboxVirtualDropdown"] li,
-  ul[data-testid="stSelectboxVirtualDropdownEmpty"] li,
-  ul[role="listbox"] li,
-  li[role="option"] {{
-      background:{MENU_BG} !important; color:{TEXT} !important; }}
-  div[data-baseweb="popover"] li *,
-  ul[data-testid="stSelectboxVirtualDropdown"] li *,
-  ul[role="listbox"] li *,
-  li[role="option"] * {{ color:{TEXT} !important; }}
+  /* Dropdown options ship fully transparent with no hover or keyboard
+     highlight of their own — verified in the browser, mouse-over and ArrowDown
+     both leave every row unchanged. The theme has no setting for this, so the
+     one affordance it cannot express is kept. */
   div[data-baseweb="popover"] li:hover,
   div[data-baseweb="popover"] li[aria-selected="true"],
-  ul[data-testid="stSelectboxVirtualDropdown"] li:hover,
   li[role="option"]:hover,
-  li[role="option"][aria-selected="true"],
-  ul[role="listbox"] li:hover,
-  div[data-baseweb="menu"] li:hover {{
-      background:{MENU_HOVER} !important; color:{TEXT} !important; }}
-  div[data-baseweb="popover"] li:hover *,
-  li[role="option"]:hover *,
-  li[role="option"][aria-selected="true"] * {{ color:{TEXT} !important; }}
-
-  /* ---- multiselect chips ---- */
-  span[data-baseweb="tag"] {{
-      background:{MENU_HOVER} !important; color:{TEXT} !important; }}
-  span[data-baseweb="tag"] span,
-  span[data-baseweb="tag"] div {{ color:{TEXT} !important; }}
-  span[data-baseweb="tag"] svg {{ fill:{TEXT} !important; }}
-
-  /* ---- file uploader ---- */
-  [data-testid="stFileUploaderDropzone"] div,
-  [data-testid="stFileUploaderDropzone"] span,
-  [data-testid="stFileUploaderDropzoneInstructions"] div,
-  [data-testid="stFileUploaderDropzoneInstructions"] span {{ color:{TEXT} !important; }}
-  [data-testid="stFileUploaderDropzone"] small {{ color:{MUTED} !important; }}
-  [data-testid="stFileUploaderDropzone"] button {{
-      background:{MENU_HOVER} !important; color:{TEXT} !important;
-      border-color:#2A313B !important; }}
-  [data-testid="stFileUploaderFile"] div,
-  [data-testid="stFileUploaderFile"] span {{ color:{TEXT} !important; }}
+  li[role="option"][aria-selected="true"] {{
+      background:{MENU_HOVER} !important; }}
 </style>
 """
 
@@ -917,10 +843,9 @@ def main() -> None:
         metric_default = pick_col(nums, "xG") or (nums[0] if nums else None)
         metric = st.sidebar.selectbox("Metric", nums,
                                       index=nums.index(metric_default) if metric_default in nums else 0)
-        basis = st.sidebar.selectbox(
-            "Basis", ["Team - Opponent", "Team", "Opponent", "Opponent - Team"], index=0)
+        basis = st.sidebar.selectbox("Basis", TEAM_BASES, index=0)
 
-        is_diff = basis in ("Team - Opponent", "Opponent - Team")
+        is_diff = basis == "Team - Opponent"
 
         invert = st.sidebar.checkbox(
             "Lower is better (e.g. PPDA)", value=is_inverse_metric(metric),
@@ -940,25 +865,14 @@ def main() -> None:
                 # metric has its difference negated rather than recoloured.
                 base["diff"] = -base["diff"]
                 over_label, under_label = "Better than opponent", "Worse than opponent"
-                if basis == "Team - Opponent":
-                    stat_default = (f"{metric}: {fmt_num(own_tot)} / "
-                                    f"Opp: {fmt_num(opp_tot)} / "
-                                    f"{fmt_signed(opp_tot - own_tot)}")
-                else:
-                    stat_default = (f"Opp {metric}: {fmt_num(opp_tot)} / "
-                                    f"{team}: {fmt_num(own_tot)} / "
-                                    f"{fmt_signed(own_tot - opp_tot)}")
-            elif basis == "Team - Opponent":
-                stat_default = (f"{metric}: {fmt_num(own_tot)} / "
-                                f"Opp: {fmt_num(opp_tot)} / "
-                                f"{fmt_signed(own_tot - opp_tot)}")
+                signed = fmt_signed(opp_tot - own_tot)
             else:
-                stat_default = (f"Opp {metric}: {fmt_num(opp_tot)} / "
-                                f"{team}: {fmt_num(own_tot)} / "
-                                f"{fmt_signed(opp_tot - own_tot)}")
+                signed = fmt_signed(own_tot - opp_tot)
+            stat_default = (f"{metric}: {fmt_num(own_tot)} / "
+                            f"Opp: {fmt_num(opp_tot)} / {signed}")
         else:
             # Single raw metric: a rolling average, not an over/under story.
-            disp = metric if basis == "Team" else f"Opponent {metric}"
+            disp = metric
             y_label = disp
             vals = pd.to_numeric(base["diff"], errors="coerce")
             stat_default = (f"{disp} total: {fmt_num(vals.sum(skipna=True))} / "
