@@ -34,6 +34,15 @@ PANEL = "#161B22"
 TEXT = "#F2F4F7"
 MUTED = "#9AA4B2"
 
+# Dropdown / popover menus render in a portal outside .stApp and carry BaseWeb's
+# own emotion styles, so they need explicit colours (and !important) of their own.
+MENU_BG = "#161B22"
+MENU_HOVER = "#2A3140"
+
+# Axis labels are always pure white, never MUTED — they carry the read of the
+# chart and grey loses them against the dark background at export sizes.
+LABEL_WHITE = "#FFFFFF"
+
 OVER_DEFAULT = "#1F3FE0"
 UNDER_DEFAULT = "#B80D0D"
 LINE_DEFAULT = "#FF1A1A"
@@ -256,6 +265,20 @@ def numeric_columns(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
 
 
+# Metrics where a smaller number is the better result. Used only to pick the
+# default state of the "Lower is better" checkbox — the user always has the
+# final say, so a false positive here is a nuisance, not a wrong chart.
+INVERSE_HINTS = (
+    "ppda", "conceded", "against", "losses", "fouls",
+    "yellow", "red", "offsides",
+)
+
+
+def is_inverse_metric(name: str) -> bool:
+    low = str(name or "").lower()
+    return any(h in low for h in INVERSE_HINTS)
+
+
 def build_team_frame(df: pd.DataFrame, team: str, metric: str, basis: str):
     """Join each chosen-team row to its opponent row on Date + Match."""
     own = df[df["Team"] == team].copy()
@@ -401,30 +424,94 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
     diff = res["diff"].to_numpy(dtype=float)
     n = len(x)
 
+    # A "difference vs expected" series (Goals − xG, xCG − Conceded, Team −
+    # Opponent) is meaningful about zero, so it gets the over/under framing.
+    # A single raw metric is not — it gets a plain rolling average centred on
+    # its own data, with an optional baseline.
+    is_diff = bool(cfg.get("is_diff", True))
+
+    over_color = cfg.get("over_color", OVER_DEFAULT)
+    under_color = cfg.get("under_color", UNDER_DEFAULT)
+
+    baseline_mode = str(cfg.get("baseline_mode", "None"))
+    has_baseline = (not is_diff) and baseline_mode != "None"
+    baseline_v = cfg.get("baseline_value")
+    try:
+        baseline_v = float(baseline_v)
+    except (TypeError, ValueError):
+        baseline_v = None
+    if baseline_v is None or not np.isfinite(baseline_v):
+        has_baseline = False
+
     # ---- y limits ----
-    if cfg.get("ylim_mode") == "Fixed":
-        lim = float(cfg.get("ylim_value") or 1.0) or 1.0
+    if is_diff:
+        if cfg.get("ylim_mode") == "Fixed":
+            lim = float(cfg.get("ylim_value") or 1.0) or 1.0
+        else:
+            finite = roll[np.isfinite(roll)]
+            m = float(np.nanmax(np.abs(finite))) if finite.size else 0.0
+            lim = m * 1.15 if m > 0 else 1.0
+        ylo, yhi = -lim, lim
+    elif cfg.get("ylim_mode") == "Fixed":
+        ylo = float(cfg.get("ylim_min", 0.0))
+        yhi = float(cfg.get("ylim_max", 1.0))
+        if yhi <= ylo:
+            yhi = ylo + 1.0
     else:
-        finite = roll[np.isfinite(roll)]
-        m = float(np.nanmax(np.abs(finite))) if finite.size else 0.0
-        lim = m * 1.15 if m > 0 else 1.0
-    ax.set_ylim(-lim, lim)
+        vals = [float(v) for v in roll[np.isfinite(roll)]]
+        if has_baseline:
+            vals.append(baseline_v)
+        if vals:
+            lo, hi = min(vals), max(vals)
+            span = hi - lo
+            pad = span * 0.15 if span > 0 else (abs(hi) * 0.15 or 1.0)
+            ylo, yhi = lo - pad, hi + pad
+        else:
+            ylo, yhi = 0.0, 1.0
+    ax.set_ylim(ylo, yhi)
     ax.set_xlim(x[0] if n else 0, x[-1] if n else 1)
     ax.margins(x=0)
 
     # ---- series ----
-    if cfg.get("chart_type", "Area (over / under)").startswith("Area"):
-        safe = np.nan_to_num(roll, nan=0.0)
-        ax.fill_between(x, safe, 0, where=(safe >= 0), interpolate=True,
-                        color=cfg.get("over_color", OVER_DEFAULT), linewidth=0)
-        ax.fill_between(x, safe, 0, where=(safe <= 0), interpolate=True,
-                        color=cfg.get("under_color", UNDER_DEFAULT), linewidth=0)
-        ax.axhline(0, color="#FFFFFF", linewidth=1.2, zorder=4)
+    is_area = cfg.get("chart_type", "Area (over / under)").startswith("Area")
+
+    if is_diff:
+        if is_area:
+            safe = np.nan_to_num(roll, nan=0.0)
+            ax.fill_between(x, safe, 0, where=(safe >= 0), interpolate=True,
+                            color=over_color, linewidth=0)
+            ax.fill_between(x, safe, 0, where=(safe <= 0), interpolate=True,
+                            color=under_color, linewidth=0)
+            ax.axhline(0, color=LABEL_WHITE, linewidth=1.2, zorder=4)
+        else:
+            ax.axhline(0, color=MUTED, linewidth=0.9, linestyle="--", alpha=0.35, zorder=1)
+            ax.plot(x, roll, color=cfg.get("line_color", LINE_DEFAULT),
+                    linewidth=float(cfg.get("line_width", 2.5)),
+                    solid_capstyle="round", zorder=4)
     else:
-        ax.axhline(0, color=MUTED, linewidth=0.9, linestyle="--", alpha=0.35, zorder=1)
-        ax.plot(x, roll, color=cfg.get("line_color", LINE_DEFAULT),
-                linewidth=float(cfg.get("line_width", 2.5)), solid_capstyle="round",
-                zorder=4)
+        # No zero line: zero is not a meaningful reference for a raw metric.
+        if is_area:
+            if has_baseline:
+                # For a "lower is better" metric the good side is below the
+                # baseline, so the two fill colours swap.
+                if cfg.get("invert"):
+                    above_c, below_c = under_color, over_color
+                else:
+                    above_c, below_c = over_color, under_color
+                fill_from = baseline_v
+            else:
+                # Nothing to be good or bad relative to — one flat fill.
+                above_c = below_c = over_color
+                fill_from = ylo
+            safe = np.nan_to_num(roll, nan=fill_from)
+            ax.fill_between(x, safe, fill_from, where=(safe >= fill_from),
+                            interpolate=True, color=above_c, linewidth=0)
+            ax.fill_between(x, safe, fill_from, where=(safe <= fill_from),
+                            interpolate=True, color=below_c, linewidth=0)
+        else:
+            ax.plot(x, roll, color=cfg.get("line_color", LINE_DEFAULT),
+                    linewidth=float(cfg.get("line_width", 2.5)),
+                    solid_capstyle="round", zorder=4)
 
     # ---- cosmetics ----
     for sp in ax.spines.values():
@@ -433,7 +520,7 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
                    labelsize=max(7.5, tfs * 0.30))
     ax.set_yticks([])
     if cfg.get("gridlines"):
-        ax.set_yticks(np.linspace(-lim, lim, 5))
+        ax.set_yticks(np.linspace(ylo, yhi, 5))
         ax.set_yticklabels([])
         ax.grid(axis="y", color=MUTED, alpha=0.14, linewidth=0.8)
         ax.set_axisbelow(True)
@@ -464,18 +551,38 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
             [pd.Timestamp(res["Date"].iloc[i]).strftime("%b %y") for i in idx]
         )
 
-    # ---- rotated y labels ----
+    # ---- rotated y labels (always white) ----
     lab_fs = max(9.0, tfs * 0.38)
     lab_x = 40.0 / W
-    fig.text(lab_x, bottom + 0.75 * (top - bottom), cfg.get("over_label", "Over Performance"),
-             rotation=90, ha="center", va="center", color=MUTED, fontsize=lab_fs)
-    fig.text(lab_x, bottom + 0.25 * (top - bottom), cfg.get("under_label", "Under Performance"),
-             rotation=90, ha="center", va="center", color=MUTED, fontsize=lab_fs)
+    if is_diff:
+        fig.text(lab_x, bottom + 0.75 * (top - bottom),
+                 cfg.get("over_label", "Over Performance"),
+                 rotation=90, ha="center", va="center",
+                 color=LABEL_WHITE, fontsize=lab_fs)
+        fig.text(lab_x, bottom + 0.25 * (top - bottom),
+                 cfg.get("under_label", "Under Performance"),
+                 rotation=90, ha="center", va="center",
+                 color=LABEL_WHITE, fontsize=lab_fs)
+    else:
+        # One centred label naming the metric — there is no over/under here.
+        fig.text(lab_x, bottom + 0.5 * (top - bottom),
+                 str(cfg.get("y_label") or ""),
+                 rotation=90, ha="center", va="center",
+                 color=LABEL_WHITE, fontsize=lab_fs)
 
     # ---- annotations ----
     ann_fs = max(7.5, tfs * 0.28)
     pill = dict(boxstyle="round,pad=0.32", facecolor=PANEL, edgecolor=MUTED,
                 linewidth=0.7, alpha=0.92)
+
+    # ---- baseline (single-metric charts only) ----
+    if has_baseline and n:
+        ax.axhline(baseline_v, color=LABEL_WHITE, linewidth=1.2, linestyle="--",
+                   alpha=0.9, zorder=5)
+        blabel = str(cfg.get("baseline_label") or "")
+        if blabel:
+            ax.text(x[-1], baseline_v, "  " + blabel, ha="right", va="center",
+                    color=TEXT, fontsize=ann_fs, bbox=pill, zorder=6)
 
     if cfg.get("show_overall") and n:
         avg = float(np.nanmean(diff))
@@ -516,10 +623,13 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
 
     # vertical labels are staggered by type so a season boundary and a
     # competition change on the same game do not print on top of each other
+    # Tiers are placed relative to the actual y range, which is no longer
+    # symmetric about zero on single-metric charts.
     def vline(gx, label, color, style=":", tier=0):
         ax.axvline(gx, color=color, linewidth=1.0, linestyle=style, alpha=0.8, zorder=3)
         if label:
-            ax.text(gx, lim * (0.95 - 0.075 * tier), " " + str(label),
+            ty = yhi - (0.05 + 0.075 * tier) * (yhi - ylo)
+            ax.text(gx, ty, " " + str(label),
                     ha="left", va="top", color=color, fontsize=ann_fs, zorder=6)
 
     if cfg.get("show_season_lines") and n:
@@ -583,7 +693,74 @@ CSS = f"""
       background:{PANEL}; border:1px solid #2A313B; border-radius:10px; }}
   .stTextInput input, .stNumberInput input, .stTextArea textarea {{
       background:{BG}; color:{TEXT}; border-color:#2A313B; }}
+
+  /* ---- closed select control ---- */
   div[data-baseweb="select"] > div {{ background:{BG}; border-color:#2A313B; }}
+  div[data-baseweb="select"] div,
+  div[data-baseweb="select"] span,
+  div[data-baseweb="select"] input {{ color:{TEXT} !important; }}
+  div[data-baseweb="select"] svg {{ fill:{MUTED} !important; }}
+
+  /* ---- open dropdown menu ----
+     BaseWeb renders these in a portal with its own styles, which is why the
+     option text was dark-on-dark.
+
+     Two sets of selectors on purpose. Current Streamlit renders the list as
+     ul[data-testid="stSelectboxVirtualDropdown"] with plain <li> and NO role
+     attributes, so the role-based selectors below match nothing here — they
+     are kept for the BaseWeb markup other Streamlit versions emit. The
+     popover-descendant and data-testid rules are the ones doing the work. */
+  div[data-baseweb="popover"],
+  div[data-baseweb="popover"] > div,
+  div[data-baseweb="popover"] > div > div,
+  div[data-baseweb="popover"] ul,
+  div[data-baseweb="popover"] [data-baseweb="menu"],
+  div[data-baseweb="menu"],
+  ul[data-testid="stSelectboxVirtualDropdown"],
+  ul[data-testid="stSelectboxVirtualDropdownEmpty"],
+  ul[role="listbox"] {{
+      background:{MENU_BG} !important; color:{TEXT} !important; }}
+  div[data-baseweb="popover"] li,
+  div[data-baseweb="menu"] li,
+  ul[data-testid="stSelectboxVirtualDropdown"] li,
+  ul[data-testid="stSelectboxVirtualDropdownEmpty"] li,
+  ul[role="listbox"] li,
+  li[role="option"] {{
+      background:{MENU_BG} !important; color:{TEXT} !important; }}
+  div[data-baseweb="popover"] li *,
+  ul[data-testid="stSelectboxVirtualDropdown"] li *,
+  ul[role="listbox"] li *,
+  li[role="option"] * {{ color:{TEXT} !important; }}
+  div[data-baseweb="popover"] li:hover,
+  div[data-baseweb="popover"] li[aria-selected="true"],
+  ul[data-testid="stSelectboxVirtualDropdown"] li:hover,
+  li[role="option"]:hover,
+  li[role="option"][aria-selected="true"],
+  ul[role="listbox"] li:hover,
+  div[data-baseweb="menu"] li:hover {{
+      background:{MENU_HOVER} !important; color:{TEXT} !important; }}
+  div[data-baseweb="popover"] li:hover *,
+  li[role="option"]:hover *,
+  li[role="option"][aria-selected="true"] * {{ color:{TEXT} !important; }}
+
+  /* ---- multiselect chips ---- */
+  span[data-baseweb="tag"] {{
+      background:{MENU_HOVER} !important; color:{TEXT} !important; }}
+  span[data-baseweb="tag"] span,
+  span[data-baseweb="tag"] div {{ color:{TEXT} !important; }}
+  span[data-baseweb="tag"] svg {{ fill:{TEXT} !important; }}
+
+  /* ---- file uploader ---- */
+  [data-testid="stFileUploaderDropzone"] div,
+  [data-testid="stFileUploaderDropzone"] span,
+  [data-testid="stFileUploaderDropzoneInstructions"] div,
+  [data-testid="stFileUploaderDropzoneInstructions"] span {{ color:{TEXT} !important; }}
+  [data-testid="stFileUploaderDropzone"] small {{ color:{MUTED} !important; }}
+  [data-testid="stFileUploaderDropzone"] button {{
+      background:{MENU_HOVER} !important; color:{TEXT} !important;
+      border-color:#2A313B !important; }}
+  [data-testid="stFileUploaderFile"] div,
+  [data-testid="stFileUploaderFile"] span {{ color:{TEXT} !important; }}
 </style>
 """
 
@@ -650,6 +827,14 @@ def main() -> None:
     over_label = "Over Performance"
     under_label = "Under Performance"
     missing_opp = 0
+    # Player and Goalkeeper are always a difference vs expected; only Team can
+    # be a plain rolling average of one raw metric.
+    is_diff = True
+    y_label = ""
+    invert = False
+    baseline_mode = "None"
+    baseline_value = None
+    baseline_label = ""
 
     if mode == "Player":
         a_def = pick_col(nums, "Goals") or (nums[0] if nums else None)
@@ -698,24 +883,67 @@ def main() -> None:
         basis = st.sidebar.selectbox(
             "Basis", ["Team - Opponent", "Team", "Opponent", "Opponent - Team"], index=0)
 
+        is_diff = basis in ("Team - Opponent", "Opponent - Team")
+
+        invert = st.sidebar.checkbox(
+            "Lower is better (e.g. PPDA)", value=is_inverse_metric(metric),
+            help="Flips the good/bad colouring. On a difference basis it also "
+                 "flips the sign so positive still means better.",
+        )
+
         base, missing_opp = build_team_frame(work, team, metric, basis)
         base = base.rename(columns={"__diff": "diff"})
-        if basis in ("Team", "Opponent"):
-            over_label = f"{metric} ↑"
-            under_label = f"{metric} ↓"
 
         own_tot = base["__own_v"].sum(skipna=True)
         opp_tot = base["__opp_v"].sum(skipna=True)
-        if basis == "Team":
-            stat_default = f"{metric} ({team}): {fmt_num(own_tot)}"
-        elif basis == "Opponent":
-            stat_default = f"{metric} (opponents): {fmt_num(opp_tot)}"
-        elif basis == "Team - Opponent":
-            stat_default = (f"{metric}: {fmt_num(own_tot)} / "
-                            f"Opp: {fmt_num(opp_tot)} / {fmt_signed(own_tot - opp_tot)}")
+
+        if is_diff:
+            if invert:
+                # Positive should always read as "good", so a lower-is-better
+                # metric has its difference negated rather than recoloured.
+                base["diff"] = -base["diff"]
+                over_label, under_label = "Better than opponent", "Worse than opponent"
+                if basis == "Team - Opponent":
+                    stat_default = (f"{metric}: {fmt_num(own_tot)} / "
+                                    f"Opp: {fmt_num(opp_tot)} / "
+                                    f"{fmt_signed(opp_tot - own_tot)}")
+                else:
+                    stat_default = (f"Opp {metric}: {fmt_num(opp_tot)} / "
+                                    f"{team}: {fmt_num(own_tot)} / "
+                                    f"{fmt_signed(own_tot - opp_tot)}")
+            elif basis == "Team - Opponent":
+                stat_default = (f"{metric}: {fmt_num(own_tot)} / "
+                                f"Opp: {fmt_num(opp_tot)} / "
+                                f"{fmt_signed(own_tot - opp_tot)}")
+            else:
+                stat_default = (f"Opp {metric}: {fmt_num(opp_tot)} / "
+                                f"{team}: {fmt_num(own_tot)} / "
+                                f"{fmt_signed(opp_tot - own_tot)}")
         else:
-            stat_default = (f"Opp {metric}: {fmt_num(opp_tot)} / "
-                            f"{team}: {fmt_num(own_tot)} / {fmt_signed(opp_tot - own_tot)}")
+            # Single raw metric: a rolling average, not an over/under story.
+            disp = metric if basis == "Team" else f"Opponent {metric}"
+            y_label = disp
+            vals = pd.to_numeric(base["diff"], errors="coerce")
+            stat_default = (f"{disp} total: {fmt_num(vals.sum(skipna=True))} / "
+                            f"per game: {fmt_num(vals.mean(skipna=True))}")
+
+            st.sidebar.markdown("### Baseline")
+            baseline_mode = st.sidebar.selectbox(
+                "Baseline",
+                ["None", "Overall average", "Custom value (e.g. league average)"],
+                index=1,
+            )
+            mean_v = float(vals.mean(skipna=True)) if vals.notna().any() else 0.0
+            if baseline_mode == "Overall average":
+                baseline_value = mean_v
+                baseline_label = st.sidebar.text_input(
+                    "Baseline label", f"Average {fmt_num(mean_v)}")
+            elif baseline_mode.startswith("Custom"):
+                baseline_value = float(st.sidebar.number_input(
+                    "Baseline value", value=round(mean_v, 2), step=0.05, format="%.4f"))
+                baseline_label = st.sidebar.text_input(
+                    "Baseline label", f"League avg {fmt_num(baseline_value)}")
+
         actual_col, expected_col = metric, f"Opponent {metric}"
 
         st.info(f"{team}: {len(base):,} matches. "
@@ -756,10 +984,22 @@ def main() -> None:
         line_color = st.sidebar.color_picker("Line", LINE_DEFAULT)
         line_width = st.sidebar.slider("Line width", 0.5, 8.0, 2.5, 0.1)
 
-    ylim_mode = st.sidebar.radio("Y limits", ["Auto (symmetric)", "Fixed"], index=0)
+    # Symmetric-about-zero limits only make sense for a difference series.
     ylim_value = 1.0
-    if ylim_mode == "Fixed":
-        ylim_value = st.sidebar.number_input("Fixed y limit (±)", 0.01, 1000.0, 1.0, step=0.1)
+    ylim_min, ylim_max = 0.0, 1.0
+    if is_diff:
+        ylim_mode = st.sidebar.radio("Y limits", ["Auto (symmetric)", "Fixed"], index=0)
+        if ylim_mode == "Fixed":
+            ylim_value = st.sidebar.number_input("Fixed y limit (±)", 0.01, 1000.0, 1.0, step=0.1)
+    else:
+        ylim_mode = st.sidebar.radio("Y limits", ["Auto (from data)", "Fixed"], index=0)
+        if ylim_mode == "Fixed":
+            data_lo = float(np.nanmin(res["rolling"])) if res["rolling"].notna().any() else 0.0
+            data_hi = float(np.nanmax(res["rolling"])) if res["rolling"].notna().any() else 1.0
+            ylim_min = float(st.sidebar.number_input(
+                "Y min", value=round(data_lo, 2), step=0.1, format="%.4f"))
+            ylim_max = float(st.sidebar.number_input(
+                "Y max", value=round(data_hi, 2), step=0.1, format="%.4f"))
     xaxis_mode = st.sidebar.radio("X-axis labels", ["Season", "Game number", "Date", "None"], index=0)
     gridlines = st.sidebar.checkbox("Y gridlines", value=False)
 
@@ -791,13 +1031,16 @@ def main() -> None:
     opts = [game_option_label(int(g), d, m)
             for g, d, m in zip(res["game"], res["Date"], res["Match"])]
 
+    # "+0.31" reads correctly for a difference and wrongly for a raw average.
+    fmt_avg = fmt_signed if is_diff else fmt_num
+
     with col1:
         st.markdown("**Horizontal - averages**")
         show_overall = st.checkbox("Overall average", value=False)
         overall_label = ""
         if show_overall:
             overall_label = st.text_input(
-                "Overall label", f"Average {fmt_signed(res['diff'].mean())}",
+                "Overall label", f"Average {fmt_avg(res['diff'].mean())}",
                 key="overall_lbl")
         n_seg = int(st.number_input("Segment averages", 0, 10, 0, step=1))
         segments = []
@@ -809,7 +1052,7 @@ def main() -> None:
                                   format_func=lambda k: opts[k], key=f"st{i}")
                 lo, hi = sorted((fi, ti))
                 val = float(res["diff"].iloc[lo:hi + 1].mean())
-                lbl = st.text_input("Label", f"Average {fmt_signed(val)}", key=f"sl{i}")
+                lbl = st.text_input("Label", f"Average {fmt_avg(val)}", key=f"sl{i}")
                 full = st.checkbox("Span full width", value=False, key=f"sw{i}")
                 sc = st.color_picker("Colour", "#FFFFFF", key=f"sc{i}")
                 segments.append({"from": int(res["game"].iloc[lo]),
@@ -848,10 +1091,14 @@ def main() -> None:
         "over_color": over_color, "under_color": under_color,
         "line_color": line_color, "line_width": line_width,
         "ylim_mode": ylim_mode, "ylim_value": ylim_value,
+        "ylim_min": ylim_min, "ylim_max": ylim_max,
         "xaxis_mode": xaxis_mode, "gridlines": gridlines,
         "title1": title1, "title2": title2, "subtitle": subtitle,
         "footer": footer, "title_fs": title_fs,
         "over_label": over_label, "under_label": under_label,
+        "is_diff": is_diff, "y_label": y_label, "invert": invert,
+        "baseline_mode": baseline_mode, "baseline_value": baseline_value,
+        "baseline_label": baseline_label,
         "stat_text": stat_text if show_stats else "", "stat_corner": stat_corner,
         "show_overall": show_overall, "overall_label": overall_label,
         "segments": segments, "custom_h": custom_h, "custom_v": custom_v,
