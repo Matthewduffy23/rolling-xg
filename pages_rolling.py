@@ -295,9 +295,10 @@ def is_inverse_metric(name: str) -> bool:
     return any(h in low for h in INVERSE_HINTS)
 
 
-# The only two bases. An opponent-centred view is the same chart read upside
-# down, so it was dropped rather than kept as a near-duplicate option.
-TEAM_BASES = ["Team - Opponent", "Team"]
+# The only basis left. An opponent-centred view is the same chart read upside
+# down, and a plain rolling average of one metric is what Series = "Single
+# metric" does now, so neither survives as a near-duplicate option here.
+TEAM_BASES = ["Team - Opponent"]
 
 # What the chart is a rolling average *of*. Difference is the default so the
 # original behaviour is what you get without touching anything.
@@ -781,20 +782,33 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
     # competition change on the same game do not print on top of each other
     # Tiers are placed relative to the actual y range, which is no longer
     # symmetric about zero on single-metric charts.
-    def vline(gx, label, color, style=":", tier=0):
+    def vline(gx, label, color, style=":", tier=0, at_bottom=False):
         ax.axvline(gx, color=color, linewidth=1.0, linestyle=style, alpha=0.8, zorder=3)
-        if label:
-            v_top = ylo if y_inverted else yhi
-            v_bot = yhi if y_inverted else ylo
-            ty = v_top + (0.05 + 0.075 * tier) * (v_bot - v_top)
-            ax.text(gx, ty, " " + str(label),
-                    ha="left", va="top", color=color, fontsize=ann_fs, zorder=6)
+        if not label:
+            return
+        if at_bottom:
+            # Axes-fraction y so this sits just above the x-axis whichever way
+            # the y-axis runs, and stays clear of the top-right legend.
+            # A boundary near the right edge is labelled leftwards so the text
+            # cannot run off the canvas.
+            near_right = n > 1 and (gx - x[0]) / (x[-1] - x[0]) > 0.82
+            ax.text(gx, 0.015 + 0.055 * tier,
+                    (" " if not near_right else "") + str(label) + (" " if near_right else ""),
+                    transform=ax.get_xaxis_transform(),
+                    ha="right" if near_right else "left", va="bottom",
+                    color=color, fontsize=ann_fs, zorder=6)
+            return
+        v_top = ylo if y_inverted else yhi
+        v_bot = yhi if y_inverted else ylo
+        ty = v_top + (0.05 + 0.075 * tier) * (v_bot - v_top)
+        ax.text(gx, ty, " " + str(label),
+                ha="left", va="top", color=color, fontsize=ann_fs, zorder=6)
 
     if cfg.get("show_season_lines") and n:
         prev = None
         for g, s in zip(res["game"], res["Season"]):
             if prev is not None and s != prev:
-                vline(g, s, MUTED, tier=0)
+                vline(g, s, MUTED, tier=0, at_bottom=True)
             prev = s
 
     if cfg.get("show_change_lines") and n:
@@ -1070,12 +1084,8 @@ def main() -> None:
             table_cols = [(label_a, base["a"]), (label_b, base["b"])]
 
         else:
-            metric_default = pick_col(nums, "xG") or (nums[0] if nums else None)
-            metric = st.sidebar.selectbox("Metric", nums,
-                                          index=nums.index(metric_default) if metric_default in nums else 0)
-            basis = st.sidebar.selectbox("Basis", TEAM_BASES, index=0)
-
-            is_diff = basis == "Team - Opponent"
+            metric = metric_pick("Metric", "xG", "diff_metric")
+            basis = TEAM_BASES[0]
 
             invert = st.sidebar.checkbox(
                 "Lower is better (e.g. PPDA)", value=is_inverse_metric(metric),
@@ -1089,24 +1099,16 @@ def main() -> None:
             own_tot = base["__own_v"].sum(skipna=True)
             opp_tot = base["__opp_v"].sum(skipna=True)
 
-            if is_diff:
-                if invert:
-                    # Positive should always read as "good", so a lower-is-better
-                    # metric has its difference negated rather than recoloured.
-                    base["diff"] = -base["diff"]
-                    over_label, under_label = "Better than opponent", "Worse than opponent"
-                    signed = fmt_signed(opp_tot - own_tot)
-                else:
-                    signed = fmt_signed(own_tot - opp_tot)
-                stat_default = (f"{metric}: {fmt_num(own_tot)} / "
-                                f"Opp: {fmt_num(opp_tot)} / {signed}")
+            if invert:
+                # Positive should always read as "good", so a lower-is-better
+                # metric has its difference negated rather than recoloured.
+                base["diff"] = -base["diff"]
+                over_label, under_label = "Better than opponent", "Worse than opponent"
+                signed = fmt_signed(opp_tot - own_tot)
             else:
-                # Basis "Team" is the same single-metric treatment, so it runs
-                # through the same shared controls rather than its own copy.
-                y_label = metric
-                stat_default = metric_totals(base["diff"], metric)
-                baseline_mode, baseline_value, baseline_label = baseline_controls(
-                    base["diff"], key_prefix="basis_")
+                signed = fmt_signed(own_tot - opp_tot)
+            stat_default = (f"{metric}: {fmt_num(own_tot)} / "
+                            f"Opp: {fmt_num(opp_tot)} / {signed}")
 
             actual_col, expected_col = metric, f"Opponent {metric}"
             table_cols = [(metric, base["__own_v"]),
