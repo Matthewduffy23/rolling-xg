@@ -1101,10 +1101,26 @@ def main() -> None:
     fname = slugify(f"{title1} {title2}".strip() or f"rolling_{mode}") + f"_{W}x{H}.png"
     st.download_button("Download PNG", data=png, file_name=fname, mime="image/png")
 
+    # Diagnostic line for the reported "2024-25" tick. Reads the same
+    # res["Season"] the x-axis tick is built from, so if the chart and this
+    # caption ever disagree the fault is in the chart, and if they agree but
+    # the tick still looks wrong the fault is upstream in the labels.
+    seasons = sorted({str(v) for v in res["Season"].dropna().unique()})
+    first_game = (
+        pd.Timestamp(res["Date"].iloc[0]).strftime("%d %b %Y") if len(res) else "-"
+    )
+    st.caption(
+        f"Seasons: {seasons} · first game {first_game} · "
+        f"season format {xaxis_mode} (calendar-year labels: {calendar_year}) · "
+        f"pandas {pd.__version__} · matplotlib {matplotlib.__version__}"
+    )
+
     with st.expander("Game-by-game"):
         table = pd.DataFrame({
             "Game": res["game"],
             "Date": pd.to_datetime(res["Date"]).dt.strftime("%d %b %Y"),
+            # Same column the x-axis tick is built from.
+            "Season": res["Season"],
             "Competition": res["Competition"],
             "Match": res["Match"],
         })
