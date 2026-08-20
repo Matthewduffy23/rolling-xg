@@ -52,6 +52,18 @@ OVER_DEFAULT = "#1F3FE0"
 UNDER_DEFAULT = "#B80D0D"
 LINE_DEFAULT = "#FF1A1A"
 
+# Base font sizes, quoted for a 900px-tall figure. build_chart multiplies these
+# by height/900 so an export at any size is the same composition, and by the
+# title slider's ratio to its default so that slider still scales everything.
+TITLE_FS_DEFAULT = 28.0
+SUBTITLE_FS = 14.0
+YTICK_FS = 14.0
+XTICK_FS = 13.0
+YLABEL_FS = 14.0
+STAT_FS = 14.0
+PILL_FS = 12.0
+FOOTER_FS = 10.0
+
 MINUS = "−"  # unicode minus
 
 EXPORT_SIZES = {
@@ -373,7 +385,19 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
     # point sizes stranded on a bigger canvas.
     S = H / 900.0
 
-    left_px, right_px = 120.0 * S, 58.0 * S
+    # Base sizes are quoted for a 900px-tall figure and multiplied by S. K is
+    # how far the user has moved the title slider from its default, so the
+    # slider still scales the whole composition rather than only the title.
+    K = float(cfg["title_fs"]) / TITLE_FS_DEFAULT
+    sub_fs = SUBTITLE_FS * S * K
+    ytick_fs = YTICK_FS * S * K
+    xtick_fs = XTICK_FS * S * K
+    ylabel_fs = YLABEL_FS * S * K
+    stat_fs = STAT_FS * S * K
+    pill_fs = PILL_FS * S * K
+    foot_fs = FOOTER_FS * S * K
+
+    left_px, right_px = 132.0 * S, 58.0 * S
     left, right = left_px / W, 1.0 - right_px / W
     avail_px = W - left_px - right_px
 
@@ -400,7 +424,7 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
 
     sub = str(cfg.get("subtitle") or "").strip()
     if sub:
-        sfs = max(9.0 * S, tfs * 0.46)
+        sfs = sub_fs
         if title_lines:
             y -= (5.0 * S) / H
         scpl = max(12, int(avail_px / (0.56 * sfs * dpi / 72.0)))
@@ -413,7 +437,7 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
     top = float(np.clip(top, 0.30, 0.97))
 
     # ---- footer ----
-    ffs = max(8.0 * S, tfs * 0.30)
+    ffs = foot_fs
     footer = str(cfg.get("footer") or "").strip()
     if footer:
         fig.text(left, (16.0 * S) / H, footer, ha="left", va="bottom",
@@ -480,6 +504,15 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
     ax.set_xlim(x[0] if n else 0, x[-1] if n else 1)
     ax.margins(x=0)
 
+    # For a lower-is-better raw metric, better belongs at the top: a PPDA of
+    # 6.6 should sit above a PPDA of 12. Only the axis direction flips — tick
+    # labels keep their real values, and the fills, baseline and pill are all
+    # in data coordinates so they follow automatically.
+    #
+    # Not done on a difference basis: there the sign is already flipped so
+    # positive means better, and inverting as well would undo it.
+    y_inverted = bool(cfg.get("invert")) and not is_diff
+
     # ---- series ----
     is_area = cfg.get("chart_type", "Area (over / under)").startswith("Area")
 
@@ -524,11 +557,10 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
     # ---- cosmetics ----
     # Tick labels are text colour, not MUTED: grey at export sizes is what made
     # them unreadable. ~12pt on a 900px-tall figure, scaling with it.
-    tick_fs = max(12.0 * S, tfs * 0.42)
     for sp in ax.spines.values():
         sp.set_visible(False)
-    ax.tick_params(axis="both", length=0, colors=TEXT, labelsize=tick_fs,
-                   pad=6.0 * S)
+    ax.tick_params(axis="x", length=0, colors=TEXT, labelsize=xtick_fs, pad=7.0 * S)
+    ax.tick_params(axis="y", length=0, colors=TEXT, labelsize=ytick_fs, pad=7.0 * S)
 
     # ---- y ticks ----
     # Five interior values across the range so the reader can size the swing.
@@ -538,11 +570,14 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
     ax.set_yticks(yticks)
     ax.set_yticklabels(
         [(fmt_signed(v) if is_diff else fmt_num(v)) for v in yticks],
-        color=TEXT, fontsize=tick_fs,
+        color=TEXT, fontsize=ytick_fs,
     )
     if cfg.get("gridlines"):
         ax.grid(axis="y", color=MUTED, alpha=0.14, linewidth=0.8)
         ax.set_axisbelow(True)
+
+    if y_inverted:
+        ax.invert_yaxis()
 
     # ---- x axis ----
     if xmode == "None" or n == 0:
@@ -571,7 +606,7 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
         )
 
     # ---- rotated y labels (always white) ----
-    lab_fs = max(11.0 * S, tfs * 0.38)
+    lab_fs = ylabel_fs
     lab_x = (44.0 * S) / W
     if is_diff:
         fig.text(lab_x, bottom + 0.75 * (top - bottom),
@@ -590,7 +625,7 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
                  color=LABEL_WHITE, fontsize=lab_fs)
 
     # ---- annotations ----
-    ann_fs = max(10.0 * S, tfs * 0.28)
+    ann_fs = pill_fs
     pill = dict(boxstyle="round,pad=0.32", facecolor=PANEL, edgecolor=MUTED,
                 linewidth=0.7, alpha=0.92)
 
@@ -647,7 +682,9 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
     def vline(gx, label, color, style=":", tier=0):
         ax.axvline(gx, color=color, linewidth=1.0, linestyle=style, alpha=0.8, zorder=3)
         if label:
-            ty = yhi - (0.05 + 0.075 * tier) * (yhi - ylo)
+            v_top = ylo if y_inverted else yhi
+            v_bot = yhi if y_inverted else ylo
+            ty = v_top + (0.05 + 0.075 * tier) * (v_bot - v_top)
             ax.text(gx, ty, " " + str(label),
                     ha="left", va="top", color=color, fontsize=ann_fs, zorder=6)
 
@@ -686,7 +723,7 @@ def build_chart(res: pd.DataFrame, cfg: dict) -> bytes:
         }[corner]
         ax.text(
             pos[0], pos[1], str(cfg["stat_text"]), transform=ax.transAxes,
-            ha=pos[2], va=pos[3], color=TEXT, fontsize=max(11.0 * S, tfs * 0.30),
+            ha=pos[2], va=pos[3], color=TEXT, fontsize=stat_fs,
             linespacing=1.45, zorder=7,
             bbox=dict(boxstyle="round,pad=0.55", facecolor=PANEL,
                       edgecolor=MUTED, linewidth=0.8, alpha=0.95),
@@ -962,7 +999,7 @@ def main() -> None:
     title2 = st.sidebar.text_input("Title line 2", "")
     subtitle = st.sidebar.text_input("Subtitle", f"{window}-Game Rolling Average")
     footer = st.sidebar.text_input("Footer", "Data: Wyscout")
-    title_fs = st.sidebar.slider("Title font size", 10, 60, 26, 1)
+    title_fs = st.sidebar.slider("Title font size", 10, 60, int(TITLE_FS_DEFAULT), 1)
 
     st.sidebar.markdown("### Stat box")
     show_stats = st.sidebar.checkbox("Show stat box", value=True)
