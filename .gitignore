@@ -1,3 +1,5 @@
 test/
 *.xlsx
 __pycache__/
+badges/
+crests/
