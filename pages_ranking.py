@@ -10,7 +10,9 @@ and photos can be looked up). Values are typed in, not derived from the file.
 from __future__ import annotations
 
 import io
+import unicodedata
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -21,6 +23,12 @@ EXPORT_MODES = ["Standard (auto)", "1920×1080 (banner)"]
 THEMES = ["Light", "Dark"]
 
 VALUE_FORMATS = ["Number", "1 dp", "2 dp", "€m", "£m", "%"]
+
+# The world player export runs to 80k+ rows, so the search never lists the
+# universe: it filters server-side and shows only this many matches.
+MAX_MATCHES = 30
+MIN_QUERY = 2
+DASH = "—"
 
 # Wyscout writes the league under either header depending on the export.
 LEAGUE_CANDIDATES = ("League", "Competition")
@@ -39,6 +47,23 @@ def _pick(cols, candidates):
     return None
 
 
+def normalize(s) -> str:
+    """Lowercase, accent-stripped, whitespace-collapsed. 'Thórarinsson' ->
+    'thorarinsson'."""
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKD", str(s))
+    s = s.encode("ascii", "ignore").decode("ascii")
+    return " ".join(s.lower().split())
+
+
+def _clean_series(s: pd.Series) -> pd.Series:
+    """Strings with real blanks, never the string 'nan'."""
+    out = s.astype("object").where(s.notna(), "")
+    out = out.map(lambda v: "" if v is None else str(v).strip())
+    return out.replace({"nan": "", "NaN": "", "None": "", "<NA>": ""})
+
+
 def read_any(file) -> pd.DataFrame:
     """Read one CSV or XLSX upload."""
     name = str(getattr(file, "name", "") or "").lower()
@@ -55,15 +80,45 @@ def read_any(file) -> pd.DataFrame:
         return pd.read_csv(file, encoding="latin-1")
 
 
-def load_entities(files, mode: str) -> tuple[pd.DataFrame, list[str]]:
-    """Concat + de-dupe the uploads down to one row per entity."""
-    frames = []
-    problems: list[str] = []
+def _named(name: str, data: bytes):
+    """BytesIO that keeps its filename, so read_any can spot .xlsx."""
+    buf = io.BytesIO(data)
+    buf.name = name
+    return buf
+
+
+def to_payload(files) -> tuple:
+    """((filename, bytes), ...) — a hashable cache key for st.cache_data."""
+    out = []
     for f in files:
         try:
-            frames.append(read_any(f))
+            f.seek(0)
+        except Exception:
+            pass
+        data = f.getvalue() if hasattr(f, "getvalue") else f.read()
+        out.append((str(getattr(f, "name", "upload")), bytes(data)))
+    return tuple(out)
+
+
+def load_entities(files, mode: str) -> tuple[pd.DataFrame, list[str]]:
+    """Concat + de-dupe the uploads down to one row per entity."""
+    return load_universe(to_payload(files), mode)
+
+
+@st.cache_data(show_spinner="Indexing upload…")
+def load_universe(payload: tuple, mode: str) -> tuple[pd.DataFrame, list[str]]:
+    """Parse + index once per set of uploaded bytes.
+
+    Cached on the file bytes, so typing in the search box never re-parses the
+    upload — it only filters the indexed frame.
+    """
+    frames = []
+    problems: list[str] = []
+    for name, data in payload:
+        try:
+            frames.append(read_any(_named(name, data)))
         except Exception as exc:  # noqa: BLE001
-            problems.append(f"{getattr(f, 'name', 'file')}: {exc}")
+            problems.append(f"{name}: {exc}")
     frames = [f for f in frames if f is not None and not f.empty]
     if not frames:
         return pd.DataFrame(), problems
@@ -83,33 +138,83 @@ def load_entities(files, mode: str) -> tuple[pd.DataFrame, list[str]]:
 
     out = pd.DataFrame()
     if mode == "Player":
-        out["Player"] = raw[player_col].astype(str).str.strip()
-    out["Team"] = raw[team_col].astype(str).str.strip()
-    out["League"] = (raw[league_col].astype(str).str.strip()
-                     if league_col else "")
+        out["Player"] = _clean_series(raw[player_col])
+    out["Team"] = _clean_series(raw[team_col])
+    out["League"] = (_clean_series(raw[league_col]) if league_col
+                     else pd.Series([""] * len(raw)))
 
     for extra in ("Age", "Position", "Minutes played"):
         col = _pick(raw.columns, (extra,))
         if col is not None:
             out[extra] = raw[col]
 
+    # A player at two clubs is two rows on purpose — the label carries the
+    # club, so both stay selectable. Only truly identical rows collapse.
     key = ["Player", "Team", "League"] if mode == "Player" else ["Team", "League"]
-    out = out.dropna(subset=key[:1]).drop_duplicates(subset=key, keep="first")
-    out = out[out[key[0]].astype(str).str.len() > 0]
+    name_col = key[0]
+    out = out.drop_duplicates(subset=key, keep="first")
+    # The entity itself must have a name; a missing Team is fine and renders
+    # as an em dash.
+    out = out[out[name_col].str.len() > 0]
+
+    # Search index, built once here so a keystroke only has to filter.
+    out["name_key"] = out[name_col].map(normalize)
+    out["search_key"] = (
+        out["name_key"] + " " +
+        (out["Team"].map(normalize) if mode == "Player" else "") + " " +
+        out["League"].map(normalize)
+    ).str.replace(r"\s+", " ", regex=True).str.strip()
+
     sort_key = key if mode == "Player" else ["Team"]
     return out.sort_values(sort_key).reset_index(drop=True), problems
 
 
 def entity_label(row, mode: str) -> str:
-    """'Coventry City — England 2.' / 'R. Durosinmi — Pisa — Italy 2.'"""
-    league = str(row.get("League", "") or "").strip()
-    if mode == "Player":
-        bits = [str(row.get("Player", "")).strip(), str(row.get("Team", "")).strip()]
-    else:
-        bits = [str(row.get("Team", "")).strip()]
-    if league:
-        bits.append(league)
-    return " — ".join(b for b in bits if b)
+    """'Coventry City — England 2.' / 'R. Durosinmi — Pisa — Italy 2.'
+
+    Anything missing shows as an em dash rather than 'nan'.
+    """
+    def bit(name):
+        v = str(row.get(name, "") or "").strip()
+        return DASH if v in ("", "nan", "None") else v
+
+    parts = [bit("Player"), bit("Team"), bit("League")] if mode == "Player" \
+        else [bit("Team"), bit("League")]
+    return " — ".join(parts)
+
+
+# ==========================================================================
+# Search
+# ==========================================================================
+def search_entities(universe: pd.DataFrame, query: str, mode: str,
+                    limit: int = MAX_MATCHES) -> pd.DataFrame:
+    """Filter the universe server-side; return at most `limit` ranked matches.
+
+    Every whitespace-separated token has to appear somewhere in the row's
+    search key, so "ar pisa" finds Durosinmi at Pisa. Matches are ranked
+    name-prefix first, then name-substring, then everything else.
+    """
+    q = normalize(query)
+    if universe.empty or len(q) < MIN_QUERY:
+        return universe.iloc[0:0]
+
+    keys = universe["search_key"]
+    mask = None
+    for token in q.split():
+        hit = keys.str.contains(token, regex=False, na=False)
+        mask = hit if mask is None else (mask & hit)
+    if mask is None:
+        return universe.iloc[0:0]
+
+    hits = universe.loc[mask]
+    if hits.empty:
+        return hits
+
+    names = hits["name_key"]
+    rank = np.where(names.str.startswith(q), 0,
+                    np.where(names.str.contains(q, regex=False, na=False), 1, 2))
+    order = np.lexsort((hits.index.to_numpy(), rank))
+    return hits.iloc[order[:limit]]
 
 
 # ==========================================================================
@@ -151,14 +256,18 @@ def add_entry(mode: str, row, value: float = 0.0) -> None:
     entries = get_list(mode)
     st.session_state.setdefault("ranking_uid", 0)
     st.session_state["ranking_uid"] += 1
+    def field(name):
+        v = str(row.get(name, "") or "").strip()
+        return DASH if v in ("", "nan", "None") else v
+
     entry = {
         "id": st.session_state["ranking_uid"],
-        "Team": str(row.get("Team", "")).strip(),
-        "League": str(row.get("League", "") or "").strip(),
+        "Team": field("Team"),
+        "League": field("League"),
         "value": float(value),
     }
     if mode == "Player":
-        entry["Player"] = str(row.get("Player", "")).strip()
+        entry["Player"] = field("Player")
     entries.append(entry)
 
 
@@ -192,6 +301,26 @@ def build_dataframe(entries: list[dict], mode: str, value_fmt: str,
         col = "_MetricForBars" if mode == "Player" else "_tri_val"
         df = df.sort_values(col, ascending=False, kind="mergesort")
     return df.reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def render_cached(mode, df, metric_label, title_lines, theme, export_mode,
+                  highlight, footer):
+    """The PNG only depends on these inputs, so typing in the search box
+    (which changes none of them) reuses the last render instead of
+    re-drawing the figure and re-fetching crests on every keystroke."""
+    if mode == "Player":
+        return RI.render_player_image(
+            df, metric_label=metric_label, title_lines=list(title_lines),
+            theme=theme, export_mode=export_mode,
+            highlight_players=(list(highlight) if highlight else None),
+            custom_footer_text=footer,
+        )
+    return RI.render_team_image(
+        df, metric_label=metric_label, title_lines=list(title_lines),
+        theme=theme, export_mode=export_mode,
+        highlight_team=highlight, custom_footer_text=footer,
+    )
 
 
 # ==========================================================================
@@ -231,17 +360,36 @@ def main() -> None:
     # ---------------- 2. build the ordered list ----------------
     st.markdown("### 2. The list")
     if not universe.empty:
-        labels = [entity_label(r, mode) for _, r in universe.iterrows()]
-        c_pick, c_add = st.columns([6, 1])
-        idx = c_pick.selectbox(
-            f"Search {mode.lower()}s", range(len(labels)),
-            format_func=lambda k: labels[k], key=f"ranking_pick_{mode}",
-            label_visibility="collapsed",
+        query = st.text_input(
+            "Search", "", key=f"ranking_query_{mode}",
+            placeholder=("Name, team or league — e.g. \"durosinmi\", "
+                         "\"coventry\", \"ar pisa\""),
+            help=f"Type at least {MIN_QUERY} characters. The top "
+                 f"{MAX_MATCHES} matches are shown.",
         )
-        c_add.button(
-            "Add", key=f"ranking_add_{mode}", width="stretch",
-            on_click=add_entry, args=(mode, universe.iloc[int(idx)]),
-        )
+        matches = search_entities(universe, query, mode)
+
+        if len(normalize(query)) < MIN_QUERY:
+            st.caption(f"Type at least {MIN_QUERY} characters to search "
+                       f"{len(universe):,} {mode.lower()}s.")
+        elif matches.empty:
+            st.caption(f"No {mode.lower()} matches “{query}”.")
+        else:
+            labels = [entity_label(r, mode) for _, r in matches.iterrows()]
+            capped = len(labels) == MAX_MATCHES
+            c_pick, c_add = st.columns([6, 1])
+            pos = c_pick.selectbox(
+                f"Matches for “{query}”", range(len(labels)),
+                format_func=lambda k: labels[k],
+                key=f"ranking_pick_{mode}", label_visibility="collapsed",
+            )
+            c_add.button(
+                "Add", key=f"ranking_add_{mode}", width="stretch",
+                on_click=add_entry, args=(mode, matches.iloc[int(pos)]),
+            )
+            st.caption(f"{len(labels)} match{'es' if len(labels) != 1 else ''}"
+                       + (f" (capped at {MAX_MATCHES} — narrow the search)"
+                          if capped else ""))
 
     show_thumbs = st.checkbox(
         "Show crests / photos in the list", value=False,
@@ -339,20 +487,11 @@ def main() -> None:
             "Footer text (one line each)", value="",
             key=f"ranking_footer_{mode}")
 
-    if mode == "Player":
-        png = RI.render_player_image(
-            df, metric_label=metric_label, title_lines=[t1, t2, t3],
-            theme=theme, export_mode=export_mode,
-            highlight_players=(highlight or None),
-            custom_footer_text=(footer_text if use_footer else None),
-        )
-    else:
-        png = RI.render_team_image(
-            df, metric_label=metric_label, title_lines=[t1, t2, t3],
-            theme=theme, export_mode=export_mode,
-            highlight_team=highlight_team,
-            custom_footer_text=(footer_text if use_footer else None),
-        )
+    png = render_cached(
+        mode, df, metric_label, (t1, t2, t3), theme, export_mode,
+        tuple(highlight or ()) if mode == "Player" else highlight_team,
+        footer_text if use_footer else None,
+    )
 
     if not png:
         st.info("Nothing to render.")
